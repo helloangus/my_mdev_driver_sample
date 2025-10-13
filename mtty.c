@@ -30,6 +30,7 @@
 #include <uapi/linux/serial_reg.h>
 #include <linux/eventfd.h>
 #include <linux/anon_inodes.h>
+#include <linux/vmalloc.h>
 
 /*
  * #defines
@@ -164,6 +165,10 @@ struct mdev_state {
 	struct serial_port s[2];
 	struct mutex rxtx_lock;
 	struct vfio_device_info dev_info;
+
+	/* optional mmio backing for BAR2 */
+	void *memblk;
+	u64 memsize;
 	int nr_ports;
 	enum vfio_device_mig_state state;
 	struct mutex state_mutex;
@@ -277,6 +282,14 @@ static void mtty_create_config_space(struct mdev_state *mdev_state)
 		mdev_state->bar_mask[1] = ~(MTTY_IO_BAR_SIZE) + 1;
 	}
 
+		/* BAR2: MMIO space (mappable) */
+		/* indicate mem BAR, 32-bit prefetchable=0, mem type 32-bit */
+		/* Configure BAR2 as a 32-bit memory BAR that is not prefetchable */
+		STORE_LE32((u32 *) &mdev_state->vconfig[0x18], 0x000000);
+		/* set mask for mmio backing size */
+		/* Initialize the BAR mask to determine the size of the MMIO backing space */
+		mdev_state->bar_mask[2] = ~(MTTY_MMIO_BAR_SIZE) + 1;
+
 	/* Subsystem ID */
 	STORE_LE32((u32 *) &mdev_state->vconfig[0x2c], 0x32534348);
 
@@ -349,7 +362,33 @@ static void handle_pci_cfg_write(struct mdev_state *mdev_state, u16 offset,
 		cfg_addr |= (mdev_state->vconfig[offset] & 0x3ul);
 		STORE_LE32(&mdev_state->vconfig[offset], cfg_addr);
 		break;
-	case 0x18:  /* BAR2 */
+		case 0x18:  /* BAR2 */
+			    bar_index = 2;
+	
+				/* 
+				 * 从缓冲区获取guest写入的32位值
+				 * 注意：当前实现可能存在对齐问题，推荐使用get_unaligned_le32或memcpy后转换
+				 */
+				u32 guest_val = *(u32 *)buf;
+				pr_info("BAR%d addr 0x%x\n", bar_index, guest_val);
+	
+				/* 
+				 * 处理BAR地址探测操作
+				 * 当guest写入0xffffffff时，表示进行BAR大小探测，
+				 * 此时返回预先设置的掩码值
+				 */
+				if (guest_val == 0xffffffff) {
+					bar_mask = mdev_state->bar_mask[bar_index];
+					guest_val = (guest_val & bar_mask);
+				}
+	
+				/* 
+				 * 保留并恢复BAR寄存器的低位标志位
+				 * 包括IO/MEM标志位和类型位，确保功能标识不被覆盖
+				 */
+				guest_val |= (mdev_state->vconfig[offset] & 0x3ul);
+				STORE_LE32(&mdev_state->vconfig[offset], guest_val);
+				break;
 	case 0x1c:  /* BAR3 */
 	case 0x20:  /* BAR4 */
 		STORE_LE32(&mdev_state->vconfig[offset], 0);
@@ -735,9 +774,48 @@ static ssize_t mdev_access(struct mdev_state *mdev_state, u8 *buf, size_t count,
 
 		break;
 
-	case VFIO_PCI_BAR0_REGION_INDEX ... VFIO_PCI_BAR5_REGION_INDEX:
-		if (!mdev_state->region_info[index].start)
-			mdev_read_base(mdev_state);
+		/**
+		 * 处理VFIO PCI设备BAR区域的读写访问
+		 * 
+		 * 处理PCI设备BAR0到BAR5区域的内存映射I/O访问。对于BAR2区域，
+		 * 提供了特殊的处理逻辑来直接暴露原始的MMIO后备缓冲区。
+		 */
+		case VFIO_PCI_BAR0_REGION_INDEX ... VFIO_PCI_BAR5_REGION_INDEX:
+			/* 如果当前BAR区域的起始地址未初始化，则读取基础配置信息 */
+			if (!mdev_state->region_info[index].start)
+				mdev_read_base(mdev_state);
+			
+			pr_info("%s: BAR%d %s at offset 0x%llx\n", __func__,
+				index, is_write ? "write" : "read", offset);
+			
+			/* 特殊处理BAR2区域：直接暴露原始的MMIO后备缓冲区 */
+			if (index == VFIO_PCI_BAR2_REGION_INDEX) {
+				/* 检查访问是否超出内存块边界 */
+				if (offset + count > mdev_state->memsize) {
+					ret = -EINVAL;
+					goto accessfailed;
+				}
+				if (is_write) {
+					pr_info("MMIO BAR write\n");
+					/* 打印写入缓冲区的每个字节数据 */
+					for (int i = 0; i < count; i++)
+						pr_info("write buffer[%d] is 0x%02x\n",
+							i, *(buf + i));
+					/* 将数据从输入缓冲区复制到设备内存块 */
+					memcpy(mdev_state->memblk + offset, buf, count);
+					dump_buffer(buf, count);
+				} else {
+					/* 从设备内存块复制数据到输出缓冲区 */
+					memcpy(buf, mdev_state->memblk + offset, count);
+					pr_info("MMIO BAR read\n");
+					/* 打印读取缓冲区的每个字节数据 */
+					for (int i = 0; i < count; i++)
+						pr_info("read buffer[%d] is 0x%02x\n",
+							i, *(buf + i));
+					dump_buffer(buf, count);
+				}
+				break;
+			}
 
 		if (is_write) {
 			dump_buffer(buf, count);
@@ -1353,6 +1431,14 @@ static int mtty_init_dev(struct vfio_device *vdev)
 	vdev->log_ops = &mtty_log_ops;
 	mdev_state->state = VFIO_DEVICE_STATE_RUNNING;
 
+	/* allocate backing memory for BAR2 (mappable) */
+	mdev_state->memsize = MTTY_MMIO_BAR_SIZE;
+	mdev_state->memblk = vmalloc(mdev_state->memsize);
+	if (!mdev_state->memblk) {
+		ret = -ENOMEM;
+		goto err_nr_ports;
+	}
+
 	return 0;
 
 err_nr_ports:
@@ -1389,7 +1475,47 @@ static void mtty_release_dev(struct vfio_device *vdev)
 	mutex_destroy(&mdev_state->reset_mutex);
 	mutex_destroy(&mdev_state->state_mutex);
 	atomic_add(mdev_state->nr_ports, &mdev_avail_ports);
+	if (mdev_state->memblk)
+		vfree(mdev_state->memblk);
 	kfree(mdev_state->vconfig);
+}
+
+
+/**
+ * mtty_mmap - 将设备内存映射到用户空间
+ * @vdev: VFIO设备结构体指针
+ * @vma: 虚拟内存区域结构体指针
+ *
+ * 该函数实现VFIO设备的mmap操作，将设备的BAR2内存区域映射到用户空间。
+ * 主要进行参数验证和内存映射操作。
+ *
+ * 返回值：
+ *   成功时返回0，失败时返回负的错误码
+ */
+static int mtty_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
+{
+	/* 获取mdev_state结构体指针 */
+	struct mdev_state *mdev_state =
+		container_of(vdev, struct mdev_state, vdev);
+
+	/* 验证内存映射偏移量是否正确 */
+	if (vma->vm_pgoff != MTTY_VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_BAR2_REGION_INDEX) >> PAGE_SHIFT)
+		return -EINVAL;
+	
+	/* 验证虚拟内存区域的起始和结束地址是否有效 */
+	if (vma->vm_end < vma->vm_start)
+		return -EINVAL;
+	
+	/* 验证映射内存大小是否超过设备内存大小 */
+	if (vma->vm_end - vma->vm_start > mdev_state->memsize)
+		return -EINVAL;
+	
+	/* 验证是否为共享内存映射 */
+	if ((vma->vm_flags & VM_SHARED) == 0)
+		return -EINVAL;
+
+	/* 执行实际的内存映射操作 */
+	return remap_vmalloc_range(vma, mdev_state->memblk, 0);
 }
 
 static void mtty_remove(struct mdev_device *mdev)
@@ -1747,6 +1873,11 @@ static int mtty_get_region_info(struct mdev_state *mdev_state,
 		if (mdev_state->nr_ports == 2)
 			size = MTTY_IO_BAR_SIZE;
 		break;
+	case VFIO_PCI_BAR2_REGION_INDEX:
+			 size = MTTY_MMIO_BAR_SIZE;
+			 region_info->flags = VFIO_REGION_INFO_FLAG_READ |
+					VFIO_REGION_INFO_FLAG_WRITE | VFIO_REGION_INFO_FLAG_MMAP;
+		break;
 	default:
 		size = 0;
 		break;
@@ -1758,8 +1889,12 @@ static int mtty_get_region_info(struct mdev_state *mdev_state,
 
 	region_info->size = size;
 	region_info->offset = MTTY_VFIO_PCI_INDEX_TO_OFFSET(bar_index);
-	region_info->flags = VFIO_REGION_INFO_FLAG_READ |
-		VFIO_REGION_INFO_FLAG_WRITE;
+	if (bar_index == VFIO_PCI_BAR2_REGION_INDEX)
+		region_info->flags = VFIO_REGION_INFO_FLAG_READ |
+			VFIO_REGION_INFO_FLAG_WRITE | VFIO_REGION_INFO_FLAG_MMAP;
+	else
+		region_info->flags = VFIO_REGION_INFO_FLAG_READ |
+			VFIO_REGION_INFO_FLAG_WRITE;
 	mutex_unlock(&mdev_state->ops_lock);
 	return 0;
 }
@@ -1956,6 +2091,7 @@ static const struct vfio_device_ops mtty_dev_ops = {
 	.release = mtty_release_dev,
 	.read = mtty_read,
 	.write = mtty_write,
+	.mmap = mtty_mmap,
 	.ioctl = mtty_ioctl,
 	.bind_iommufd	= vfio_iommufd_emulated_bind,
 	.unbind_iommufd	= vfio_iommufd_emulated_unbind,
