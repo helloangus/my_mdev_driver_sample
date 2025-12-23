@@ -18,7 +18,7 @@
 #include <linux/list.h>
 #include <linux/device.h>
 #include <linux/vfio.h>
-
+#include <linux/timekeeping.h>
 
 #include <linux/platform_device.h>
 
@@ -26,7 +26,9 @@ static struct platform_device *mdev_pdev;
 
 
 #define DEVICE_NAME "mdev_dsched"
-#define TARGET_PATH "/var/log/mdev_shared.txt"
+#define LOG_DIR "/var/log"
+#define LOG_PREFIX "mdev_dsched"
+
 #define QUEUE_SIZE 4096
 
 struct my_mdev {
@@ -37,6 +39,8 @@ struct my_mdev {
     bool running;                  /* 是否当前持有时间片 */
     struct mutex lock;
     struct list_head list_node;    /* 链表连接到父驱动 */
+
+    char uuid[64];
 };
 
 struct parent_priv {
@@ -46,30 +50,35 @@ struct parent_priv {
     struct task_struct *sched_thread;
     wait_queue_head_t wake_sched;
     bool stop;
+
+    char log_path[256];
 };
 
 static struct parent_priv *g_parent;
 
 /* ========== helper: write kernel buffer to host file ========== */
-static int host_write_all(const char *buf, size_t len)
+static int host_write_all(struct parent_priv *p,
+                          const char *buf, size_t len)
 {
     struct file *filp;
     loff_t pos = 0;
     ssize_t written;
 
-    filp = filp_open(TARGET_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (!p || !p->log_path[0])
+        return -EINVAL;
+
+    filp = filp_open(p->log_path,
+                     O_WRONLY | O_CREAT | O_APPEND,
+                     0644);
     if (IS_ERR(filp))
         return PTR_ERR(filp);
 
     written = kernel_write(filp, buf, len, &pos);
-    if (written < 0) {
-        filp_close(filp, NULL);
-        return (int)written;
-    }
-
     filp_close(filp, NULL);
-    return 0;
+
+    return written < 0 ? (int)written : 0;
 }
+
 
 /* ========== scheduler thread ========== */
 static int sched_thread_fn(void *data)
@@ -122,7 +131,15 @@ static int sched_thread_fn(void *data)
                 if (copied_bytes > 0) {
                     buf[copied_bytes] = '\n';
                     buf[copied_bytes + 1] = '\0';
-                    host_write_all(buf, copied_bytes + 1);
+                    char line[512];
+
+                    snprintf(line, sizeof(line),
+                            "[%s] %.*s\n",
+                            sel->uuid,
+                            copied_bytes,
+                            buf);
+
+                    host_write_all(p, line, strlen(line));
                 }
                 kfree(buf);
             }
@@ -198,6 +215,10 @@ static int my_mdev_create(struct mdev_device *mdev)
     mm->timeslice_ms = 100;
     mutex_init(&mm->lock);
     INIT_LIST_HEAD(&mm->list_node);
+
+    strscpy(mm->uuid,
+        dev_name(mdev_dev(mdev)),
+        sizeof(mm->uuid));
 
     /* attach mm 到 mdev->priv（使用 mdev_dev 宏转换到 struct device）*/
     dev_set_drvdata(mdev_dev(mdev), mm);
@@ -346,6 +367,26 @@ static int mdev_dsched_pdrv_probe(struct platform_device *pdev)
     p->stop = false;
 
     p->parent.dev = &pdev->dev;
+
+    {
+        struct timespec64 ts;
+        struct tm tm;
+
+        ktime_get_real_ts64(&ts);
+        time64_to_tm(ts.tv_sec, 0, &tm);
+
+        snprintf(p->log_path, sizeof(p->log_path),
+                LOG_DIR "/%s_%04ld%02d%02d_%02d%02d%02d.txt",
+                LOG_PREFIX,
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec);
+
+        dev_info(&pdev->dev, "log file: %s\n", p->log_path);
+    }
 
     ret = mdev_register_parent(&p->parent,
                                &pdev->dev,
