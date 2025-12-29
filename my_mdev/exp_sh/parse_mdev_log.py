@@ -4,8 +4,13 @@ import sys
 import argparse
 from collections import defaultdict
 
+# 匹配块头：[uuid]
+UUID_RE = re.compile(
+    r'^\[(?P<uuid>[^\]]+)\]\s*$'
+)
+
+# 匹配数据行：id=... seq=... ts=...
 LOG_RE = re.compile(
-    r'\[(?P<uuid>[^\]]+)\]\s+'
     r'id=(?P<id>\S+)\s+'
     r'seq=(?P<seq>\d+)\s+'
     r'ts=(?P<ts>\d+\.\d+)'
@@ -29,17 +34,33 @@ def main():
         "writers": defaultdict(int),
     })
 
+    current_uuid = None
+
     with open(args.logfile) as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            # 1. 是否是 UUID 块头
+            m_uuid = UUID_RE.match(line)
+            if m_uuid:
+                current_uuid = m_uuid.group("uuid")
+                continue
+
+            # 2. 是否是数据行
             m = LOG_RE.search(line)
             if not m:
                 continue
 
-            uuid = m.group("uuid")
-            wid  = m.group("id")
-            ts   = float(m.group("ts"))
+            # 3. 没有 UUID 上下文，直接忽略（防御性）
+            if current_uuid is None:
+                continue
 
-            s = stats[uuid]
+            wid = m.group("id")
+            ts  = float(m.group("ts"))
+
+            s = stats[current_uuid]
             s["count"] += 1
             s["writers"][wid] += 1
 

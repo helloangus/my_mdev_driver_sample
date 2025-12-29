@@ -7,3 +7,4 @@
 modules.order
 my_mdev/Module.symvers
 my_mdev/modules.order
+my_mdev/exp_sh/results/

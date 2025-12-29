@@ -2,15 +2,17 @@
 set -e
 
 MOD=host_mdev_sched
-SYSFS_BASE=/sys/devices/platform/mdev_dsched/mdev_supported_types/mdev_dsched-mdev_dsched
+SYSFS_BASE=/sys/devices/platform/mdev_dsched_platform_parent/mdev_supported_types/mdev_dsched_platform_parent-mdev_dsched
 LOG_DIR=/var/log
 RESULT_DIR=$(pwd)/results
 
 mkdir -p $RESULT_DIR/{raw,csv,summary}
 
 load_module() {
-    sudo modprobe vfio vfio_iommu_type1 mdev
-    sudo insmod ../host_mdev_sched.ko || true
+    sudo modprobe vfio
+    sudo modprobe vfio_iommu_type1
+    sudo modprobe mdev
+    sudo insmod /home/angus/gpu_dev/mtty_build/linux-6.8/samples/vfio-mdev/my_mdev/host_mdev_sched.ko || true
 }
 
 cleanup() {
@@ -28,11 +30,11 @@ WRITER_PIDS=()
 run_writer() {
     UUID=$1
     ID=$2
-    SIZE=64
+    SIZE=40
     INTERVAL=$3
     COUNT=$4
 
-    sudo ../mdev_writer \
+    sudo ./mdev_writer \
     --uuid $UUID \
     --id $ID \
     --size $SIZE \
@@ -49,4 +51,5 @@ wait_writers() {
         wait $pid
     done
     WRITER_PIDS=()
+    sleep 2
 }

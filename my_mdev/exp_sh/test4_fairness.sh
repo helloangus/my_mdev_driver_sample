@@ -4,9 +4,9 @@ load_module
 
 UUID=$(create_mdev)
 
-run_writer $UUID VM1 5000000 100
-run_writer $UUID VM2 5000000 100
-run_writer $UUID VM3 5000000 100
+run_writer $UUID VM1 5000 100
+run_writer $UUID VM2 5000 100
+run_writer $UUID VM3 5000 100
 
 wait_writers
 
@@ -18,3 +18,5 @@ python3 parse_mdev_log.py $LOG --detail \
 
 python3 calc_jain.py results/summary/t4_raw.txt \
     > results/summary/t4_jain.txt
+
+cleanup

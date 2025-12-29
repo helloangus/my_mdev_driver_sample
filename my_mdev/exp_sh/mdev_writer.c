@@ -86,7 +86,7 @@ int main(int argc, char *argv[])
     unsigned long iter = 0;
 
     fprintf(stderr,
-        "[writer %s] uuid=%s size=%zu interval=%u us count=%lu\n",
+        "[writer %s] uuid=%s size=%zu interval=%u us count=%lu",
         writer_id, uuid, write_size, interval_us, count);
 
     while (count == 0 || iter < count) {
@@ -99,7 +99,9 @@ int main(int argc, char *argv[])
                            tv.tv_sec, tv.tv_usec);
 
         if ((size_t)len < write_size) {
-            memset(buf + len, 'X', write_size - len);
+            memset(buf + len, 'X', write_size - len - 2);
+            memset(buf + write_size - 2, '\r', 1);
+            memset(buf + write_size - 1, '\n', 1);
             len = write_size;
         }
 

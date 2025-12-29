@@ -73,6 +73,8 @@ static int host_write_all(struct parent_priv *p,
     if (IS_ERR(filp))
         return PTR_ERR(filp);
 
+    pr_info("%s: writing %zu bytes to log file\n",
+            DEVICE_NAME, len);
     written = kernel_write(filp, buf, len, &pos);
     filp_close(filp, NULL);
 
@@ -129,17 +131,11 @@ static int sched_thread_fn(void *data)
             if (buf) {
                 unsigned int copied_bytes = kfifo_out(&sel->queue, buf, tocopy);
                 if (copied_bytes > 0) {
-                    buf[copied_bytes] = '\n';
-                    buf[copied_bytes + 1] = '\0';
-                    char line[512];
-
-                    snprintf(line, sizeof(line),
-                            "[%s] %.*s\n",
-                            sel->uuid,
-                            copied_bytes,
-                            buf);
-
-                    host_write_all(p, line, strlen(line));
+                    host_write_all(p, "[", 1);
+                    host_write_all(p, sel->uuid, strlen(sel->uuid));
+                    host_write_all(p, "] \r\n", 4);
+                    host_write_all(p, buf, copied_bytes);
+                    host_write_all(p, "\n", 1);
                 }
                 kfree(buf);
             }
@@ -169,7 +165,6 @@ static ssize_t mdev_in_store(struct device *dev,
                              struct device_attribute *attr,
                              const char *buf, size_t count)
 {
-    struct mdev_device *mdev = to_mdev_device(dev);
     struct my_mdev *mm = dev_get_drvdata(dev);
     size_t tocopy;
 
@@ -183,24 +178,42 @@ static ssize_t mdev_in_store(struct device *dev,
 
     /* 唤醒调度线程 */
     if (g_parent)
+        pr_info("%s: waking scheduler after enqueue %zu bytes to mdev %s\n",
+                DEVICE_NAME, tocopy, mm->uuid);
         wake_up_interruptible(&g_parent->wake_sched);
 
     /* 返回写入的字节（note: sysfs expects count or consumed len; return count to mimic user write) */
     return count;
 }
-// static DEVICE_ATTR_WO(mdev_in); /* name: "mdev_in", but will appear as "mdev_in" -- we will expose as "in" below */
 
-// /* Note: DEVICE_ATTR_WO macro created attribute named "mdev_in". We'll create a wrapper attribute structure
-//  * with the desired name ("in") dynamically in probe so the sysfs file path is /sys/.../<mdev>/in
-//  */
+static ssize_t mdev_modify_priority_store(struct device *dev,
+                             struct device_attribute *attr,
+                             const char *buf, size_t count)
+{
+    struct my_mdev *mm = dev_get_drvdata(dev);
+    unsigned int new_prio;
+    int ret;
 
-/* ========== mdev instance lifecycle ========== */
+    if (!mm)
+        return -EINVAL;
+
+    ret = kstrtouint(buf, 10, &new_prio);
+    if (ret)
+        return ret;
+
+    mutex_lock(&mm->lock);
+    mm->priority = new_prio;
+    mutex_unlock(&mm->lock);
+
+    pr_info("%s: mdev %s priority changed to %u\n", DEVICE_NAME,
+            mm->uuid, mm->priority);
+
+    return count;
+}
+
 static int my_mdev_create(struct mdev_device *mdev)
 {
     struct my_mdev *mm;
-    // int ret = 0;
-    // struct device_attribute *attr_in = NULL;
-    // char *attr_name = NULL;
 
     mm = kzalloc(sizeof(*mm), GFP_KERNEL);
     if (!mm)
@@ -234,8 +247,6 @@ static int my_mdev_create(struct mdev_device *mdev)
     return 0;
 }
 
-/* We'll use one static device_attribute named "in" (per-device kobj supports same attribute name) */
-static DEVICE_ATTR(in, 0220, NULL, mdev_in_store);
 
 static void my_mdev_remove(struct mdev_device *mdev)
 {
@@ -255,39 +266,6 @@ static void my_mdev_remove(struct mdev_device *mdev)
     pr_info("%s: removed mdev instance\n", DEVICE_NAME);
 }
 
-// static ssize_t my_parent_write_fallback(struct mdev_device *mdev, const char __user *ubuf, size_t count)
-// {
-//     /* For completeness: if some code still calls an old-style function expecting a userbuf,
-//      * provide a fallback that copies into kernel buffer and enqueues.
-//      */
-//     char *tmp;
-//     struct my_mdev *mm = dev_get_drvdata(mdev_dev(mdev));
-//     size_t tocopy;
-
-//     if (!mm)
-//         return -EINVAL;
-
-//     tocopy = min(count, (size_t)(QUEUE_SIZE - 1));
-//     tmp = kmalloc(tocopy, GFP_KERNEL);
-//     if (!tmp)
-//         return -ENOMEM;
-
-//     if (copy_from_user(tmp, ubuf, tocopy)) {
-//         kfree(tmp);
-//         return -EFAULT;
-//     }
-
-//     tocopy = kfifo_in(&mm->queue, tmp, tocopy);
-//     kfree(tmp);
-
-//     if (g_parent)
-//         wake_up_interruptible(&g_parent->wake_sched);
-
-//     return (ssize_t)tocopy;
-// }
-
-/* ========== New-style mdev_driver binding ========== */
-
 /* minimal mdev_type */
 static struct mdev_type my_mdev_type = {
     .sysfs_name = "mdev_dsched",
@@ -301,7 +279,11 @@ static struct mdev_type *my_mdev_types[] = {
 
 static struct mdev_driver my_mdev_driver;
 
-/* probe and remove for mdev_driver simply call our create/remove */
+/* We'll use one static device_attribute named "in" (per-device kobj supports same attribute name) */
+static DEVICE_ATTR(in, 0220, NULL, mdev_in_store);
+static DEVICE_ATTR(priority, 0220, NULL, mdev_modify_priority_store);
+
+// 虚拟设备 driver probe/remove
 static int my_mdev_probe(struct mdev_device *mdev)
 {
     pr_info("%s: probe mdev=%p dev=%p driver=%p\n", DEVICE_NAME,
@@ -323,6 +305,13 @@ static int my_mdev_probe(struct mdev_device *mdev)
         my_mdev_remove(mdev);
         return ret;
     }
+    ret = device_create_file(mdev_dev(mdev), &dev_attr_priority);
+    if (ret) {
+        pr_err("%s: failed to create /sys/.../priority (%d)\n", DEVICE_NAME, ret);
+        /* cleanup created instance */
+        my_mdev_remove(mdev);
+        return ret;
+    }
 
     return 0;
 }
@@ -335,6 +324,7 @@ static void my_mdev_remove_drv(struct mdev_device *mdev)
 
     /* remove attribute and instance */
     device_remove_file(mdev_dev(mdev), &dev_attr_in);
+    device_remove_file(mdev_dev(mdev), &dev_attr_priority);
     my_mdev_remove(mdev);
 }
 
@@ -352,6 +342,8 @@ static struct mdev_driver my_mdev_driver = {
     },
 };
 
+
+// 父设备 driver probe/remove
 static int mdev_dsched_pdrv_probe(struct platform_device *pdev)
 {
     int ret;
@@ -432,7 +424,7 @@ static struct platform_driver mdev_dsched_pdrv = {
     .probe  = mdev_dsched_pdrv_probe,
     .remove = mdev_dsched_pdrv_remove,
     .driver = {
-        .name = "mdev_dsched",
+        .name = "mdev_dsched_platform_parent",
         .owner = THIS_MODULE,
     },
 };
@@ -455,7 +447,7 @@ static int __init my_mdev_init(void)
         goto err_unregister_mdev_driver;
 
     /* 3. create parent device */
-    mdev_pdev = platform_device_register_simple("mdev_dsched", -1, NULL, 0);
+    mdev_pdev = platform_device_register_simple("mdev_dsched_platform_parent", -1, NULL, 0);
     if (IS_ERR(mdev_pdev)) {
         ret = PTR_ERR(mdev_pdev);
         goto err_unregister_platform_driver;
