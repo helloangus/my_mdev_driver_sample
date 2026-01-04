@@ -177,11 +177,12 @@ static ssize_t mdev_in_store(struct device *dev,
     tocopy = kfifo_in(&mm->queue, buf, tocopy);
 
     /* 唤醒调度线程 */
-    if (g_parent)
+    if (g_parent) {
         pr_info("%s: waking scheduler after enqueue %zu bytes to mdev %s\n",
                 DEVICE_NAME, tocopy, mm->uuid);
         wake_up_interruptible(&g_parent->wake_sched);
-
+    }
+    
     /* 返回写入的字节（note: sysfs expects count or consumed len; return count to mimic user write) */
     return count;
 }

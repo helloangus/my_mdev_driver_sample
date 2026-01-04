@@ -5,6 +5,6 @@
 *.cmd
 *.o.*
 modules.order
-my_mdev/Module.symvers
-my_mdev/modules.order
+*/modules.order
 my_mdev/exp_sh/results/
+*/Module.symvers
