@@ -26,7 +26,7 @@ static struct platform_device *mdev_pdev;
 
 
 #define DEVICE_NAME "mdev_dsched"
-#define LOG_DIR "/var/log"
+#define LOG_DIR "/var/log/mdev"
 #define LOG_PREFIX "mdev_dsched"
 
 #define QUEUE_SIZE 4096
@@ -87,6 +87,8 @@ static int sched_thread_fn(void *data)
 {
     struct parent_priv *p = data;
 
+    pr_info("%s: scheduler thread started\n", DEVICE_NAME);
+
     while (!kthread_should_stop()) {
         struct my_mdev *sel = NULL;
         struct my_mdev *iter;
@@ -118,6 +120,7 @@ static int sched_thread_fn(void *data)
 
         if (!sel)
             continue;
+        pr_info("%s: scheduling mdev %s\n", DEVICE_NAME, sel->uuid);
 
         /* grant timeslice */
         mutex_lock(&sel->lock);

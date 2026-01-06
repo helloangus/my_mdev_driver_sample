@@ -4,7 +4,7 @@
 *.mod
 *.cmd
 *.o.*
-modules.order
 */modules.order
 my_mdev/exp_sh/results/
 */Module.symvers
+*/guest.qcow2

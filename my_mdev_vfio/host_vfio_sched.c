@@ -55,7 +55,7 @@
 				(((u64)(1) << MMDEV_VFIO_PCI_OFFSET_SHIFT) - 1)
 #define MAX_MMDEVS	24
 
-#define LOG_DIR "/var/log"
+#define LOG_DIR "/var/log/mdev"
 #define LOG_PREFIX "mdev_dsched"
 #define QUEUE_SIZE 4096
 
@@ -145,7 +145,7 @@ static struct mmdev_type {
 	  .type.pretty_name = "Single port serial" },
 	{ .nr_ports = 2, .type.sysfs_name = "2",
 	  .type.pretty_name = "Dual port serial" },
-	{ .nr_ports = 0, .type.sysfs_name = "3",
+	{ .nr_ports = 0, .type.sysfs_name = "WO",
 	  .type.pretty_name = "Write only port" },
 };
 
@@ -251,6 +251,14 @@ static void mmdev_create_config_space(struct mdev_state *mdev_state)
 	/* Initialize the BAR mask to determine the size of the MMIO backing space */
 	mdev_state->bar_mask[2] = ~(MMDEV_MMIO_BAR_SIZE) + 1;
 
+	/* BAR3: MMIO space (mappable) */
+	/* indicate mem BAR, 32-bit prefetchable=0, mem type 32-bit */
+	/* Configure BAR3 as a 32-bit memory BAR that is not prefetchable */
+	STORE_LE32((u32 *) &mdev_state->vconfig[0x1c], 0x000000);
+	/* set mask for mmio backing size */
+	/* Initialize the BAR mask to determine the size of the MMIO backing space */
+	mdev_state->bar_mask[3] = ~(QUEUE_SIZE) + 1;
+
 	/* Subsystem ID */
 	STORE_LE32((u32 *) &mdev_state->vconfig[0x2c], 0x32534348);
 
@@ -323,34 +331,37 @@ static void handle_pci_cfg_write(struct mdev_state *mdev_state, u16 offset,
 		cfg_addr |= (mdev_state->vconfig[offset] & 0x3ul);
 		STORE_LE32(&mdev_state->vconfig[offset], cfg_addr);
 		break;
-		case 0x18:  /* BAR2 */
-			    bar_index = 2;
-	
-				/* 
-				 * 从缓冲区获取guest写入的32位值
-				 * 注意：当前实现可能存在对齐问题，推荐使用get_unaligned_le32或memcpy后转换
-				 */
-				u32 guest_val = *(u32 *)buf;
-				pr_info("BAR%d addr 0x%x\n", bar_index, guest_val);
-	
-				/* 
-				 * 处理BAR地址探测操作
-				 * 当guest写入0xffffffff时，表示进行BAR大小探测，
-				 * 此时返回预先设置的掩码值
-				 */
-				if (guest_val == 0xffffffff) {
-					bar_mask = mdev_state->bar_mask[bar_index];
-					guest_val = (guest_val & bar_mask);
-				}
-	
-				/* 
-				 * 保留并恢复BAR寄存器的低位标志位
-				 * 包括IO/MEM标志位和类型位，确保功能标识不被覆盖
-				 */
-				guest_val |= (mdev_state->vconfig[offset] & 0x3ul);
-				STORE_LE32(&mdev_state->vconfig[offset], guest_val);
-				break;
+	case 0x18:  /* BAR2 */
 	case 0x1c:  /* BAR3 */
+		if (offset == 0x18)
+			bar_index = 2;
+		else if (offset == 0x1c)
+			bar_index = 3;
+
+		/* 
+			* 从缓冲区获取guest写入的32位值
+			* 注意：当前实现可能存在对齐问题，推荐使用get_unaligned_le32或memcpy后转换
+			*/
+		u32 guest_val = *(u32 *)buf;
+		pr_info("BAR%d addr 0x%x\n", bar_index, guest_val);
+
+		/* 
+			* 处理BAR地址探测操作
+			* 当guest写入0xffffffff时，表示进行BAR大小探测，
+			* 此时返回预先设置的掩码值
+			*/
+		if (guest_val == 0xffffffff) {
+			bar_mask = mdev_state->bar_mask[bar_index];
+			guest_val = (guest_val & bar_mask);
+		}
+
+		/* 
+			* 保留并恢复BAR寄存器的低位标志位
+			* 包括IO/MEM标志位和类型位，确保功能标识不被覆盖
+			*/
+		guest_val |= (mdev_state->vconfig[offset] & 0x3ul);
+		STORE_LE32(&mdev_state->vconfig[offset], guest_val);
+		break;
 	case 0x20:  /* BAR4 */
 		STORE_LE32(&mdev_state->vconfig[offset], 0);
 		break;
@@ -397,16 +408,11 @@ static void handle_bar_write(unsigned int index, struct mdev_state *mdev_state,
 			   (mdev_state->s[index].rxtx.count ==
 				    mdev_state->s[index].intr_trigger_level)) {
 				/* trigger interrupt */
-#if defined(DEBUG_INTR)
-				pr_err("Serial port %d: Fifo level trigger\n",
-					index);
-#endif
+
 				mmdev_trigger_interrupt(mdev_state);
 			}
 		} else {
-#if defined(DEBUG_INTR)
-			pr_err("Serial port %d: Buffer Overflow\n", index);
-#endif
+
 			mdev_state->s[index].overrun = true;
 
 			/*
@@ -430,10 +436,7 @@ static void handle_bar_write(unsigned int index, struct mdev_state *mdev_state,
 			if ((data & UART_IER_THRI) &&
 			    (mdev_state->s[index].rxtx.head ==
 					mdev_state->s[index].rxtx.tail)) {
-#if defined(DEBUG_INTR)
-				pr_err("Serial port %d: IER_THRI write\n",
-					index);
-#endif
+
 				mmdev_trigger_interrupt(mdev_state);
 			}
 
@@ -502,17 +505,13 @@ static void handle_bar_write(unsigned int index, struct mdev_state *mdev_state,
 
 		if ((mdev_state->s[index].uart_reg[UART_IER] & UART_IER_MSI) &&
 				(data & UART_MCR_OUT2)) {
-#if defined(DEBUG_INTR)
-			pr_err("Serial port %d: MCR_OUT2 write\n", index);
-#endif
+
 			mmdev_trigger_interrupt(mdev_state);
 		}
 
 		if ((mdev_state->s[index].uart_reg[UART_IER] & UART_IER_MSI) &&
 				(data & (UART_MCR_RTS | UART_MCR_DTR))) {
-#if defined(DEBUG_INTR)
-			pr_err("Serial port %d: MCR RTS/DTR write\n", index);
-#endif
+
 			mmdev_trigger_interrupt(mdev_state);
 		}
 		break;
@@ -561,9 +560,6 @@ static void handle_bar_read(unsigned int index, struct mdev_state *mdev_state,
 		 *  Trigger interrupt if tx buffer empty interrupt is
 		 *  enabled and fifo is empty
 		 */
-#if defined(DEBUG_INTR)
-			pr_err("Serial port %d: Buffer Empty\n", index);
-#endif
 			if (mdev_state->s[index].uart_reg[UART_IER] &
 							 UART_IER_THRI)
 				mmdev_trigger_interrupt(mdev_state);
@@ -699,6 +695,8 @@ static int sched_thread_fn(void *data)
 {
     struct mmdev_dev *p = data;
 
+	pr_info("%s: scheduler thread started\n", MMDEV_NAME);
+
     while (!kthread_should_stop()) {
         struct mdev_state *sel = NULL;
         struct mdev_state *iter;
@@ -730,6 +728,8 @@ static int sched_thread_fn(void *data)
 
         if (!sel)
             continue;
+
+		pr_info("%s: scheduling mdev %s\n", MMDEV_NAME, sel->uuid);
 
         /* grant timeslice */
         mutex_lock(&sel->write_lock);
@@ -871,11 +871,8 @@ static ssize_t mdev_access(struct mdev_state *mdev_state, u8 *buf, size_t count,
 	offset = pos & MMDEV_VFIO_PCI_OFFSET_MASK;
 	switch (index) {
 	case VFIO_PCI_CONFIG_REGION_INDEX:
-
-#if defined(DEBUG)
 		pr_info("%s: PCI config space %s at offset 0x%llx\n",
 			 __func__, is_write ? "write" : "read", offset);
-#endif
 		if (is_write) {
 			dump_buffer(buf, count);
 			handle_pci_cfg_write(mdev_state, offset, buf, count);
@@ -892,42 +889,66 @@ static ssize_t mdev_access(struct mdev_state *mdev_state, u8 *buf, size_t count,
 		 * 处理PCI设备BAR0到BAR5区域的内存映射I/O访问。对于BAR2区域，
 		 * 提供了特殊的处理逻辑来直接暴露原始的MMIO后备缓冲区。
 		 */
-		case VFIO_PCI_BAR0_REGION_INDEX ... VFIO_PCI_BAR5_REGION_INDEX:
-			/* 如果当前BAR区域的起始地址未初始化，则读取基础配置信息 */
-			if (!mdev_state->region_info[index].start)
-				mdev_read_base(mdev_state);
-			
-			pr_info("%s: BAR%d %s at offset 0x%llx\n", __func__,
-				index, is_write ? "write" : "read", offset);
-			
-			/* 特殊处理BAR2区域：直接暴露原始的MMIO后备缓冲区 */
-			if (index == VFIO_PCI_BAR2_REGION_INDEX) {
-				/* 检查访问是否超出内存块边界 */
-				if (offset + count > mdev_state->memsize) {
+	case VFIO_PCI_BAR0_REGION_INDEX ... VFIO_PCI_BAR5_REGION_INDEX:
+		/* 如果当前BAR区域的起始地址未初始化，则读取基础配置信息 */
+		if (!mdev_state->region_info[index].start)
+			mdev_read_base(mdev_state);
+		
+		pr_info("%s: BAR%d %s at offset 0x%llx\n", __func__,
+			index, is_write ? "write" : "read", offset);
+		
+		/* 特殊处理BAR2区域：直接暴露原始的MMIO后备缓冲区 */
+		if (index == VFIO_PCI_BAR2_REGION_INDEX) {
+			/* 检查访问是否超出内存块边界 */
+			if (offset + count > mdev_state->memsize) {
+				ret = -EINVAL;
+				goto accessfailed;
+			}
+			if (is_write) {
+				pr_info("MMIO BAR write\n");
+				/* 打印写入缓冲区的每个字节数据 */
+				for (int i = 0; i < count; i++)
+					pr_info("write buffer[%d] is 0x%02x\n",
+						i, *(buf + i));
+				/* 将数据从输入缓冲区复制到设备内存块 */
+				memcpy(mdev_state->memblk + offset, buf, count);
+				dump_buffer(buf, count);
+			} else {
+				/* 从设备内存块复制数据到输出缓冲区 */
+				memcpy(buf, mdev_state->memblk + offset, count);
+				pr_info("MMIO BAR read\n");
+				/* 打印读取缓冲区的每个字节数据 */
+				for (int i = 0; i < count; i++)
+					pr_info("read buffer[%d] is 0x%02x\n",
+						i, *(buf + i));
+				dump_buffer(buf, count);
+			}
+			break;
+		} else if (index == VFIO_PCI_BAR3_REGION_INDEX) {
+			/* Handle BAR3 region */
+			if (is_write) {
+				pr_info("MMIO BAR3 write\n");
+				if (count > QUEUE_SIZE) {
 					ret = -EINVAL;
 					goto accessfailed;
 				}
-				if (is_write) {
-					pr_info("MMIO BAR write\n");
-					/* 打印写入缓冲区的每个字节数据 */
-					for (int i = 0; i < count; i++)
-						pr_info("write buffer[%d] is 0x%02x\n",
-							i, *(buf + i));
-					/* 将数据从输入缓冲区复制到设备内存块 */
-					memcpy(mdev_state->memblk + offset, buf, count);
-					dump_buffer(buf, count);
-				} else {
-					/* 从设备内存块复制数据到输出缓冲区 */
-					memcpy(buf, mdev_state->memblk + offset, count);
-					pr_info("MMIO BAR read\n");
-					/* 打印读取缓冲区的每个字节数据 */
-					for (int i = 0; i < count; i++)
-						pr_info("read buffer[%d] is 0x%02x\n",
-							i, *(buf + i));
-					dump_buffer(buf, count);
-				}
-				break;
+				/* 打印写入缓冲区的每个字节数据 */
+				for (int i = 0; i < count; i++)
+					pr_info("write queue[%d] is 0x%02x\n",
+						i, *(buf + i));
+				/* 将数据从输入缓冲区复制到设备内存块 */
+				kfifo_in(&mdev_state->queue, buf, count);
+				pr_info("%s: waking scheduler after enqueue %zu bytes to mdev %s\n",
+					MMDEV_NAME, count, mdev_state->uuid);
+				wake_up_interruptible(&mmdev_dev.wake_sched);
+				dump_buffer(buf, count);
+			} else {
+				/* 从设备内存块复制数据到输出缓冲区 */
+				unsigned int avail = kfifo_len(&mdev_state->queue);
+				pr_info("MMIO BAR3 read %u bytes\n", avail);
 			}
+			break;
+		}
 
 		if (is_write) {
 			dump_buffer(buf, count);
@@ -1466,6 +1487,9 @@ static int mmdev_get_region_info(struct mdev_state *mdev_state,
 	case VFIO_PCI_BAR2_REGION_INDEX:
 			 size = MMDEV_MMIO_BAR_SIZE;
 		break;
+	case VFIO_PCI_BAR3_REGION_INDEX:
+			 size = MMDEV_MMIO_BAR_SIZE;
+		break;
 	default:
 		size = 0;
 		break;
@@ -1477,7 +1501,7 @@ static int mmdev_get_region_info(struct mdev_state *mdev_state,
 
 	region_info->size = size;
 	region_info->offset = MMDEV_VFIO_PCI_INDEX_TO_OFFSET(bar_index);
-	if (bar_index == VFIO_PCI_BAR2_REGION_INDEX)
+	if ((bar_index == VFIO_PCI_BAR2_REGION_INDEX) || (bar_index == VFIO_PCI_BAR3_REGION_INDEX))
 		region_info->flags = VFIO_REGION_INFO_FLAG_READ |
 			VFIO_REGION_INFO_FLAG_WRITE | VFIO_REGION_INFO_FLAG_MMAP;
 	else
