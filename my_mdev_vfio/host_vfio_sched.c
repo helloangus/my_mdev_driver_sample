@@ -20,6 +20,10 @@
 #include <linux/anon_inodes.h>
 #include <linux/vmalloc.h>
 
+#include <linux/kfifo.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+
 /*
  * #defines
  */
@@ -51,6 +55,10 @@
 				(((u64)(1) << MMDEV_VFIO_PCI_OFFSET_SHIFT) - 1)
 #define MAX_MMDEVS	24
 
+#define LOG_DIR "/var/log"
+#define LOG_PREFIX "mdev_dsched"
+#define QUEUE_SIZE 4096
+
 /*
  * Global Structures
  */
@@ -62,6 +70,14 @@ static struct mmdev_dev {
 	struct idr	vd_idr;
 	struct device	dev;
 	struct mdev_parent parent;
+
+	struct list_head instances;
+    struct mutex list_lock;
+	struct task_struct *sched_thread;
+    wait_queue_head_t wake_sched;
+	bool stop;
+
+	char log_path[256];
 } mmdev_dev;
 
 struct mdev_region_info {
@@ -70,30 +86,6 @@ struct mdev_region_info {
 	u32 size;
 	u64 vfio_offset;
 };
-
-// #if defined(DEBUG_REGS)
-// static const char *wr_reg[] = {
-// 	"TX",
-// 	"IER",
-// 	"FCR",
-// 	"LCR",
-// 	"MCR",
-// 	"LSR",
-// 	"MSR",
-// 	"SCR"
-// };
-
-// static const char *rd_reg[] = {
-// 	"RX",
-// 	"IER",
-// 	"IIR",
-// 	"LCR",
-// 	"MCR",
-// 	"LSR",
-// 	"MSR",
-// 	"SCR"
-// };
-// #endif
 
 /* loop back buffer */
 struct rxtx {
@@ -113,29 +105,6 @@ struct serial_port {
 	u8 intr_trigger_level;  /* interrupt trigger level */
 };
 
-// struct mtty_data {
-// 	u64 magic;
-// #define MTTY_MAGIC 0x7e9d09898c3e2c4e /* Nothing clever, just random */
-// 	u32 major_ver;
-// #define MTTY_MAJOR_VER 1
-// 	u32 minor_ver;
-// #define MTTY_MINOR_VER 0
-// 	u32 nr_ports;
-// 	u32 flags;
-// 	struct serial_port ports[2];
-// };
-
-struct mdev_state;
-
-// struct mtty_migration_file {
-// 	struct file *filp;
-// 	struct mutex lock;
-// 	struct mdev_state *mdev_state;
-// 	struct mtty_data data;
-// 	ssize_t filled_size;
-// 	u8 disabled:1;
-// };
-
 /* State of each mdev device */
 struct mdev_state {
 	struct vfio_device vdev;
@@ -147,37 +116,43 @@ struct mdev_state {
 	struct mdev_device *mdev;
 	struct mdev_region_info region_info[VFIO_PCI_NUM_REGIONS];
 	u32 bar_mask[VFIO_PCI_NUM_REGIONS];
-	struct list_head next;
-	struct serial_port s[2];	// TODO
-	struct mutex rxtx_lock;
+
 	struct vfio_device_info dev_info;
 
-	/* optional mmio backing for BAR2 */
+	int nr_ports;
+	struct serial_port s[2];
+	struct mutex rxtx_lock;
+
+	struct list_head list_node;
+    struct kfifo queue;            /* 待写入队列 (bytes) */
+    unsigned int priority;
+    unsigned int timeslice_ms;
+    bool running;                  /* 是否当前持有时间片 */
+	struct mutex write_lock;
+	char uuid[64];
+
 	void *memblk;
 	u64 memsize;
-	int nr_ports;
-	enum vfio_device_mig_state state;
-	struct mutex state_mutex;
-	struct mutex reset_mutex;
-	struct mtty_migration_file *saving_migf;
-	struct mtty_migration_file *resuming_migf;
-	u8 deferred_reset:1;
+
 	u8 intx_mask:1;
 };
 
 static struct mmdev_type {
 	struct mdev_type type;
 	int nr_ports;
-} mmdev_types[2] = {
+} mmdev_types[3] = {
 	{ .nr_ports = 1, .type.sysfs_name = "1",
 	  .type.pretty_name = "Single port serial" },
 	{ .nr_ports = 2, .type.sysfs_name = "2",
 	  .type.pretty_name = "Dual port serial" },
+	{ .nr_ports = 0, .type.sysfs_name = "3",
+	  .type.pretty_name = "Write only port" },
 };
 
 static struct mdev_type *mmdev_mdev_types[] = {
 	&mmdev_types[0].type,
 	&mmdev_types[1].type,
+	&mmdev_types[2].type,
 };
 
 static atomic_t mdev_avail_ports = ATOMIC_INIT(MAX_MMDEVS);
@@ -268,13 +243,13 @@ static void mmdev_create_config_space(struct mdev_state *mdev_state)
 		mdev_state->bar_mask[1] = ~(MMDEV_IO_BAR_SIZE) + 1;
 	}
 
-		/* BAR2: MMIO space (mappable) */
-		/* indicate mem BAR, 32-bit prefetchable=0, mem type 32-bit */
-		/* Configure BAR2 as a 32-bit memory BAR that is not prefetchable */
-		STORE_LE32((u32 *) &mdev_state->vconfig[0x18], 0x000000);
-		/* set mask for mmio backing size */
-		/* Initialize the BAR mask to determine the size of the MMIO backing space */
-		mdev_state->bar_mask[2] = ~(MMDEV_MMIO_BAR_SIZE) + 1;
+	/* BAR2: MMIO space (mappable) */
+	/* indicate mem BAR, 32-bit prefetchable=0, mem type 32-bit */
+	/* Configure BAR2 as a 32-bit memory BAR that is not prefetchable */
+	STORE_LE32((u32 *) &mdev_state->vconfig[0x18], 0x000000);
+	/* set mask for mmio backing size */
+	/* Initialize the BAR mask to determine the size of the MMIO backing space */
+	mdev_state->bar_mask[2] = ~(MMDEV_MMIO_BAR_SIZE) + 1;
 
 	/* Subsystem ID */
 	STORE_LE32((u32 *) &mdev_state->vconfig[0x2c], 0x32534348);
@@ -696,6 +671,153 @@ static void handle_bar_read(unsigned int index, struct mdev_state *mdev_state,
 	}
 }
 
+static int host_write_all(struct mmdev_dev *p,
+                          const char *buf, size_t len)
+{
+    struct file *filp;
+    loff_t pos = 0;
+    ssize_t written;
+
+    if (!p || !p->log_path[0])
+        return -EINVAL;
+
+    filp = filp_open(p->log_path,
+                     O_WRONLY | O_CREAT | O_APPEND,
+                     0644);
+    if (IS_ERR(filp))
+        return PTR_ERR(filp);
+
+    pr_info("%s: writing %zu bytes to log file\n",
+            MMDEV_NAME, len);
+    written = kernel_write(filp, buf, len, &pos);
+    filp_close(filp, NULL);
+
+    return written < 0 ? (int)written : 0;
+}
+
+static int sched_thread_fn(void *data)
+{
+    struct mmdev_dev *p = data;
+
+    while (!kthread_should_stop()) {
+        struct mdev_state *sel = NULL;
+        struct mdev_state *iter;
+        unsigned long best_prio = 0;
+        bool found = false;
+
+        /* pick the highest priority non-empty instance */
+        mutex_lock(&p->list_lock);
+        list_for_each_entry(iter, &p->instances, list_node) {
+            if (!kfifo_is_empty(&iter->queue)) {
+                found = true;
+                if (iter->priority >= best_prio) {
+                    best_prio = iter->priority;
+                    sel = iter;
+                }
+            }
+        }
+        mutex_unlock(&p->list_lock);
+
+        if (!found) {
+            /* 没有数据，等待唤醒或超时。等待条件：stop 或 instances 不为空（轮询） */
+            wait_event_interruptible_timeout(p->wake_sched,
+                                             p->stop || !list_empty(&p->instances),
+                                             msecs_to_jiffies(200));
+            if (p->stop || kthread_should_stop())
+                break;
+            continue;
+        }
+
+        if (!sel)
+            continue;
+
+        /* grant timeslice */
+        mutex_lock(&sel->write_lock);
+        sel->running = true;
+
+        /* 从队列读数据并写到 host 文件（示例行为） */
+        {
+            unsigned int avail = kfifo_len(&sel->queue);
+            unsigned int tocopy = min(avail, (unsigned int)(QUEUE_SIZE - 1));
+            char *buf = kmalloc(tocopy + 2, GFP_KERNEL);
+            if (buf) {
+                unsigned int copied_bytes = kfifo_out(&sel->queue, buf, tocopy);
+                if (copied_bytes > 0) {
+                    host_write_all(p, "[", 1);
+                    host_write_all(p, sel->uuid, strlen(sel->uuid));
+                    host_write_all(p, "] \r\n", 4);
+                    host_write_all(p, buf, copied_bytes);
+                    host_write_all(p, "\n", 1);
+                }
+                kfree(buf);
+            }
+        }
+
+        if (sel->timeslice_ms)
+            msleep(sel->timeslice_ms);
+        else
+            msleep(100);
+
+        sel->running = false;
+
+        mutex_unlock(&sel->write_lock);
+
+        if (kthread_should_stop() || p->stop)
+            break;
+    }
+
+    return 0;
+}
+
+static ssize_t mdev_in_store(struct device *dev,
+                             struct device_attribute *attr,
+                             const char *buf, size_t count)
+{
+    struct mdev_state *mdev_state = dev_get_drvdata(dev);
+    size_t tocopy;
+
+    if (!mdev_state)
+        return -EINVAL;
+
+    /* 限制大小，避免一次放入过多 */
+    tocopy = min(count, (size_t)(QUEUE_SIZE - 1));
+    /* kfifo_in 接受 kernel buffer */
+    tocopy = kfifo_in(&mdev_state->queue, buf, tocopy);
+
+    /* 唤醒调度线程 */
+	pr_info("%s: waking scheduler after enqueue %zu bytes to mdev %s\n",
+			MMDEV_NAME, tocopy, mdev_state->uuid);
+	wake_up_interruptible(&mmdev_dev.wake_sched);
+    
+    /* 返回写入的字节（note: sysfs expects count or consumed len; return count to mimic user write) */
+    return count;
+}
+
+static ssize_t mdev_modify_priority_store(struct device *dev,
+                             struct device_attribute *attr,
+                             const char *buf, size_t count)
+{
+    struct mdev_state *mdev_state = dev_get_drvdata(dev);
+    unsigned int new_prio;
+    int ret;
+
+    if (!mdev_state)
+        return -EINVAL;
+
+    ret = kstrtouint(buf, 10, &new_prio);
+    if (ret)
+        return ret;
+
+    mutex_lock(&mdev_state->write_lock);
+    mdev_state->priority = new_prio;
+    mutex_unlock(&mdev_state->write_lock);
+
+    pr_info("%s: mdev %s priority changed to %u\n", MMDEV_NAME,
+            mdev_state->uuid, mdev_state->priority);
+
+    return count;
+}
+
 static void mdev_read_base(struct mdev_state *mdev_state)
 {
 	int index, pos;
@@ -809,22 +931,10 @@ static ssize_t mdev_access(struct mdev_state *mdev_state, u8 *buf, size_t count,
 
 		if (is_write) {
 			dump_buffer(buf, count);
-
-// #if defined(DEBUG_REGS)
-// 			pr_info("%s: BAR%d  WR @0x%llx %s val:0x%02x dlab:%d\n",
-// 				__func__, index, offset, wr_reg[offset],
-// 				*buf, mdev_state->s[index].dlab);
-// #endif
 			handle_bar_write(index, mdev_state, offset, buf, count);
 		} else {
 			handle_bar_read(index, mdev_state, offset, buf, count);
 			dump_buffer(buf, count);
-
-// #if defined(DEBUG_REGS)
-// 			pr_info("%s: BAR%d  RD @0x%llx %s val:0x%02x dlab:%d\n",
-// 				__func__, index, offset, rd_reg[offset],
-// 				*buf, mdev_state->s[index].dlab);
-// #endif
 		}
 		break;
 
@@ -841,543 +951,6 @@ accessfailed:
 
 	return ret;
 }
-
-// static size_t mtty_data_size(struct mdev_state *mdev_state)
-// {
-// 	return offsetof(struct mtty_data, ports) +
-// 		(mdev_state->nr_ports * sizeof(struct serial_port));
-// }
-
-// static void mtty_disable_file(struct mtty_migration_file *migf)
-// {
-// 	mutex_lock(&migf->lock);
-// 	migf->disabled = true;
-// 	migf->filled_size = 0;
-// 	migf->filp->f_pos = 0;
-// 	mutex_unlock(&migf->lock);
-// }
-
-// static void mtty_disable_files(struct mdev_state *mdev_state)
-// {
-// 	if (mdev_state->saving_migf) {
-// 		mtty_disable_file(mdev_state->saving_migf);
-// 		fput(mdev_state->saving_migf->filp);
-// 		mdev_state->saving_migf = NULL;
-// 	}
-
-// 	if (mdev_state->resuming_migf) {
-// 		mtty_disable_file(mdev_state->resuming_migf);
-// 		fput(mdev_state->resuming_migf->filp);
-// 		mdev_state->resuming_migf = NULL;
-// 	}
-// }
-
-static void mtty_state_mutex_unlock(struct mdev_state *mdev_state)
-{
-again:
-	mutex_lock(&mdev_state->reset_mutex);
-	if (mdev_state->deferred_reset) {
-		mdev_state->deferred_reset = false;
-		mutex_unlock(&mdev_state->reset_mutex);
-		mdev_state->state = VFIO_DEVICE_STATE_RUNNING;
-		// mtty_disable_files(mdev_state);
-		goto again;
-	}
-	mutex_unlock(&mdev_state->state_mutex);
-	mutex_unlock(&mdev_state->reset_mutex);
-}
-
-// static int mtty_release_migf(struct inode *inode, struct file *filp)
-// {
-// 	struct mtty_migration_file *migf = filp->private_data;
-
-// 	mtty_disable_file(migf);
-// 	mutex_destroy(&migf->lock);
-// 	kfree(migf);
-
-// 	return 0;
-// }
-
-// static long mtty_precopy_ioctl(struct file *filp, unsigned int cmd,
-// 			       unsigned long arg)
-// {
-// 	struct mtty_migration_file *migf = filp->private_data;
-// 	struct mdev_state *mdev_state = migf->mdev_state;
-// 	loff_t *pos = &filp->f_pos;
-// 	struct vfio_precopy_info info = {};
-// 	unsigned long minsz;
-// 	int ret;
-
-// 	if (cmd != VFIO_MIG_GET_PRECOPY_INFO)
-// 		return -ENOTTY;
-
-// 	minsz = offsetofend(struct vfio_precopy_info, dirty_bytes);
-
-// 	if (copy_from_user(&info, (void __user *)arg, minsz))
-// 		return -EFAULT;
-// 	if (info.argsz < minsz)
-// 		return -EINVAL;
-
-// 	mutex_lock(&mdev_state->state_mutex);
-// 	if (mdev_state->state != VFIO_DEVICE_STATE_PRE_COPY &&
-// 	    mdev_state->state != VFIO_DEVICE_STATE_PRE_COPY_P2P) {
-// 		ret = -EINVAL;
-// 		goto unlock;
-// 	}
-
-// 	mutex_lock(&migf->lock);
-
-// 	if (migf->disabled) {
-// 		mutex_unlock(&migf->lock);
-// 		ret = -ENODEV;
-// 		goto unlock;
-// 	}
-
-// 	if (*pos > migf->filled_size) {
-// 		mutex_unlock(&migf->lock);
-// 		ret = -EINVAL;
-// 		goto unlock;
-// 	}
-
-// 	info.dirty_bytes = 0;
-// 	info.initial_bytes = migf->filled_size - *pos;
-// 	mutex_unlock(&migf->lock);
-
-// 	ret = copy_to_user((void __user *)arg, &info, minsz) ? -EFAULT : 0;
-// unlock:
-// 	mtty_state_mutex_unlock(mdev_state);
-// 	return ret;
-// }
-
-// static ssize_t mtty_save_read(struct file *filp, char __user *buf,
-// 			      size_t len, loff_t *pos)
-// {
-// 	struct mtty_migration_file *migf = filp->private_data;
-// 	ssize_t ret = 0;
-
-// 	if (pos)
-// 		return -ESPIPE;
-
-// 	pos = &filp->f_pos;
-
-// 	mutex_lock(&migf->lock);
-
-// 	dev_dbg(migf->mdev_state->vdev.dev, "%s ask %zu\n", __func__, len);
-
-// 	if (migf->disabled) {
-// 		ret = -ENODEV;
-// 		goto out_unlock;
-// 	}
-
-// 	if (*pos > migf->filled_size) {
-// 		ret = -EINVAL;
-// 		goto out_unlock;
-// 	}
-
-// 	len = min_t(size_t, migf->filled_size - *pos, len);
-// 	if (len) {
-// 		if (copy_to_user(buf, (void *)&migf->data + *pos, len)) {
-// 			ret = -EFAULT;
-// 			goto out_unlock;
-// 		}
-// 		*pos += len;
-// 		ret = len;
-// 	}
-// out_unlock:
-// 	dev_dbg(migf->mdev_state->vdev.dev, "%s read %zu\n", __func__, ret);
-// 	mutex_unlock(&migf->lock);
-// 	return ret;
-// }
-
-// static const struct file_operations mtty_save_fops = {
-// 	.owner = THIS_MODULE,
-// 	.read = mtty_save_read,
-// 	.unlocked_ioctl = mtty_precopy_ioctl,
-// 	.compat_ioctl = compat_ptr_ioctl,
-// 	.release = mtty_release_migf,
-// 	.llseek = no_llseek,
-// };
-
-// static void mtty_save_state(struct mdev_state *mdev_state)
-// {
-// 	struct mtty_migration_file *migf = mdev_state->saving_migf;
-// 	int i;
-
-// 	mutex_lock(&migf->lock);
-// 	for (i = 0; i < mdev_state->nr_ports; i++) {
-// 		memcpy(&migf->data.ports[i],
-// 			&mdev_state->s[i], sizeof(struct serial_port));
-// 		migf->filled_size += sizeof(struct serial_port);
-// 	}
-// 	dev_dbg(mdev_state->vdev.dev,
-// 		"%s filled to %zu\n", __func__, migf->filled_size);
-// 	mutex_unlock(&migf->lock);
-// }
-
-// static int mtty_load_state(struct mdev_state *mdev_state)
-// {
-// 	struct mtty_migration_file *migf = mdev_state->resuming_migf;
-// 	int i;
-
-// 	mutex_lock(&migf->lock);
-// 	/* magic and version already tested by resume write fn */
-// 	if (migf->filled_size < mtty_data_size(mdev_state)) {
-// 		dev_dbg(mdev_state->vdev.dev, "%s expected %zu, got %zu\n",
-// 			__func__, mtty_data_size(mdev_state),
-// 			migf->filled_size);
-// 		mutex_unlock(&migf->lock);
-// 		return -EINVAL;
-// 	}
-
-// 	for (i = 0; i < mdev_state->nr_ports; i++)
-// 		memcpy(&mdev_state->s[i],
-// 		       &migf->data.ports[i], sizeof(struct serial_port));
-
-// 	mutex_unlock(&migf->lock);
-// 	return 0;
-// }
-
-// static struct mtty_migration_file *
-// mtty_save_device_data(struct mdev_state *mdev_state,
-// 		      enum vfio_device_mig_state state)
-// {
-// 	struct mtty_migration_file *migf = mdev_state->saving_migf;
-// 	struct mtty_migration_file *ret = NULL;
-
-// 	if (migf) {
-// 		if (state == VFIO_DEVICE_STATE_STOP_COPY)
-// 			goto fill_data;
-// 		return ret;
-// 	}
-
-// 	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
-// 	if (!migf)
-// 		return ERR_PTR(-ENOMEM);
-
-// 	migf->filp = anon_inode_getfile("mtty_mig", &mtty_save_fops,
-// 					migf, O_RDONLY);
-// 	if (IS_ERR(migf->filp)) {
-// 		int rc = PTR_ERR(migf->filp);
-
-// 		kfree(migf);
-// 		return ERR_PTR(rc);
-// 	}
-
-// 	stream_open(migf->filp->f_inode, migf->filp);
-// 	mutex_init(&migf->lock);
-// 	migf->mdev_state = mdev_state;
-
-// 	migf->data.magic = MTTY_MAGIC;
-// 	migf->data.major_ver = MTTY_MAJOR_VER;
-// 	migf->data.minor_ver = MTTY_MINOR_VER;
-// 	migf->data.nr_ports = mdev_state->nr_ports;
-
-// 	migf->filled_size = offsetof(struct mtty_data, ports);
-
-// 	dev_dbg(mdev_state->vdev.dev, "%s filled header to %zu\n",
-// 		__func__, migf->filled_size);
-
-// 	ret = mdev_state->saving_migf = migf;
-
-// fill_data:
-// 	if (state == VFIO_DEVICE_STATE_STOP_COPY)
-// 		mtty_save_state(mdev_state);
-
-// 	return ret;
-// }
-
-// static ssize_t mtty_resume_write(struct file *filp, const char __user *buf,
-// 				 size_t len, loff_t *pos)
-// {
-// 	struct mtty_migration_file *migf = filp->private_data;
-// 	struct mdev_state *mdev_state = migf->mdev_state;
-// 	loff_t requested_length;
-// 	ssize_t ret = 0;
-
-// 	if (pos)
-// 		return -ESPIPE;
-
-// 	pos = &filp->f_pos;
-
-// 	if (*pos < 0 ||
-// 	    check_add_overflow((loff_t)len, *pos, &requested_length))
-// 		return -EINVAL;
-
-// 	if (requested_length > mtty_data_size(mdev_state))
-// 		return -ENOMEM;
-
-// 	mutex_lock(&migf->lock);
-
-// 	if (migf->disabled) {
-// 		ret = -ENODEV;
-// 		goto out_unlock;
-// 	}
-
-// 	if (copy_from_user((void *)&migf->data + *pos, buf, len)) {
-// 		ret = -EFAULT;
-// 		goto out_unlock;
-// 	}
-
-// 	*pos += len;
-// 	ret = len;
-
-// 	dev_dbg(migf->mdev_state->vdev.dev, "%s received %zu, total %zu\n",
-// 		__func__, len, migf->filled_size + len);
-
-// 	if (migf->filled_size < offsetof(struct mtty_data, ports) &&
-// 	    migf->filled_size + len >= offsetof(struct mtty_data, ports)) {
-// 		if (migf->data.magic != MTTY_MAGIC || migf->data.flags ||
-// 		    migf->data.major_ver != MTTY_MAJOR_VER ||
-// 		    migf->data.minor_ver != MTTY_MINOR_VER ||
-// 		    migf->data.nr_ports != mdev_state->nr_ports) {
-// 			dev_dbg(migf->mdev_state->vdev.dev,
-// 				"%s failed validation\n", __func__);
-// 			ret = -EFAULT;
-// 		} else {
-// 			dev_dbg(migf->mdev_state->vdev.dev,
-// 				"%s header validated\n", __func__);
-// 		}
-// 	}
-
-// 	migf->filled_size += len;
-
-// out_unlock:
-// 	mutex_unlock(&migf->lock);
-// 	return ret;
-// }
-
-// static const struct file_operations mtty_resume_fops = {
-// 	.owner = THIS_MODULE,
-// 	.write = mtty_resume_write,
-// 	.release = mtty_release_migf,
-// 	.llseek = no_llseek,
-// };
-
-// static struct mtty_migration_file *
-// mtty_resume_device_data(struct mdev_state *mdev_state)
-// {
-// 	struct mtty_migration_file *migf;
-// 	int ret;
-
-// 	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
-// 	if (!migf)
-// 		return ERR_PTR(-ENOMEM);
-
-// 	migf->filp = anon_inode_getfile("mtty_mig", &mtty_resume_fops,
-// 					migf, O_WRONLY);
-// 	if (IS_ERR(migf->filp)) {
-// 		ret = PTR_ERR(migf->filp);
-// 		kfree(migf);
-// 		return ERR_PTR(ret);
-// 	}
-
-// 	stream_open(migf->filp->f_inode, migf->filp);
-// 	mutex_init(&migf->lock);
-// 	migf->mdev_state = mdev_state;
-
-// 	mdev_state->resuming_migf = migf;
-
-// 	return migf;
-// }
-
-// static struct file *mtty_step_state(struct mdev_state *mdev_state,
-// 				     enum vfio_device_mig_state new)
-// {
-// 	enum vfio_device_mig_state cur = mdev_state->state;
-
-// 	dev_dbg(mdev_state->vdev.dev, "%s: %d -> %d\n", __func__, cur, new);
-
-// 	/*
-// 	 * The following state transitions are no-op considering
-// 	 * mtty does not do DMA nor require any explicit start/stop.
-// 	 *
-// 	 *         RUNNING -> RUNNING_P2P
-// 	 *         RUNNING_P2P -> RUNNING
-// 	 *         RUNNING_P2P -> STOP
-// 	 *         PRE_COPY -> PRE_COPY_P2P
-// 	 *         PRE_COPY_P2P -> PRE_COPY
-// 	 *         STOP -> RUNNING_P2P
-// 	 */
-// 	if ((cur == VFIO_DEVICE_STATE_RUNNING &&
-// 	     new == VFIO_DEVICE_STATE_RUNNING_P2P) ||
-// 	    (cur == VFIO_DEVICE_STATE_RUNNING_P2P &&
-// 	     (new == VFIO_DEVICE_STATE_RUNNING ||
-// 	      new == VFIO_DEVICE_STATE_STOP)) ||
-// 	    (cur == VFIO_DEVICE_STATE_PRE_COPY &&
-// 	     new == VFIO_DEVICE_STATE_PRE_COPY_P2P) ||
-// 	    (cur == VFIO_DEVICE_STATE_PRE_COPY_P2P &&
-// 	     new == VFIO_DEVICE_STATE_PRE_COPY) ||
-// 	    (cur == VFIO_DEVICE_STATE_STOP &&
-// 	     new == VFIO_DEVICE_STATE_RUNNING_P2P))
-// 		return NULL;
-
-// 	/*
-// 	 * The following state transitions simply close migration files,
-// 	 * with the exception of RESUMING -> STOP, which needs to load
-// 	 * the state first.
-// 	 *
-// 	 *         RESUMING -> STOP
-// 	 *         PRE_COPY -> RUNNING
-// 	 *         PRE_COPY_P2P -> RUNNING_P2P
-// 	 *         STOP_COPY -> STOP
-// 	 */
-// 	if (cur == VFIO_DEVICE_STATE_RESUMING &&
-// 	    new == VFIO_DEVICE_STATE_STOP) {
-// 		int ret;
-
-// 		ret = mtty_load_state(mdev_state);
-// 		if (ret)
-// 			return ERR_PTR(ret);
-// 		mtty_disable_files(mdev_state);
-// 		return NULL;
-// 	}
-
-// 	if ((cur == VFIO_DEVICE_STATE_PRE_COPY &&
-// 	     new == VFIO_DEVICE_STATE_RUNNING) ||
-// 	    (cur == VFIO_DEVICE_STATE_PRE_COPY_P2P &&
-// 	     new == VFIO_DEVICE_STATE_RUNNING_P2P) ||
-// 	    (cur == VFIO_DEVICE_STATE_STOP_COPY &&
-// 	     new == VFIO_DEVICE_STATE_STOP)) {
-// 		mtty_disable_files(mdev_state);
-// 		return NULL;
-// 	}
-
-// 	/*
-// 	 * The following state transitions return migration files.
-// 	 *
-// 	 *         RUNNING -> PRE_COPY
-// 	 *         RUNNING_P2P -> PRE_COPY_P2P
-// 	 *         STOP -> STOP_COPY
-// 	 *         STOP -> RESUMING
-// 	 *         PRE_COPY_P2P -> STOP_COPY
-// 	 */
-// 	if ((cur == VFIO_DEVICE_STATE_RUNNING &&
-// 	     new == VFIO_DEVICE_STATE_PRE_COPY) ||
-// 	    (cur == VFIO_DEVICE_STATE_RUNNING_P2P &&
-// 	     new == VFIO_DEVICE_STATE_PRE_COPY_P2P) ||
-// 	    (cur == VFIO_DEVICE_STATE_STOP &&
-// 	     new == VFIO_DEVICE_STATE_STOP_COPY) ||
-// 	    (cur == VFIO_DEVICE_STATE_PRE_COPY_P2P &&
-// 	     new == VFIO_DEVICE_STATE_STOP_COPY)) {
-// 		struct mtty_migration_file *migf;
-
-// 		migf = mtty_save_device_data(mdev_state, new);
-// 		if (IS_ERR(migf))
-// 			return ERR_CAST(migf);
-
-// 		if (migf) {
-// 			get_file(migf->filp);
-
-// 			return migf->filp;
-// 		}
-// 		return NULL;
-// 	}
-
-// 	if (cur == VFIO_DEVICE_STATE_STOP &&
-// 	    new == VFIO_DEVICE_STATE_RESUMING) {
-// 		struct mtty_migration_file *migf;
-
-// 		migf = mtty_resume_device_data(mdev_state);
-// 		if (IS_ERR(migf))
-// 			return ERR_CAST(migf);
-
-// 		get_file(migf->filp);
-
-// 		return migf->filp;
-// 	}
-
-// 	/* vfio_mig_get_next_state() does not use arcs other than the above */
-// 	WARN_ON(true);
-// 	return ERR_PTR(-EINVAL);
-// }
-
-// static struct file *mtty_set_state(struct vfio_device *vdev,
-// 				   enum vfio_device_mig_state new_state)
-// {
-// 	struct mdev_state *mdev_state =
-// 		container_of(vdev, struct mdev_state, vdev);
-// 	struct file *ret = NULL;
-
-// 	dev_dbg(vdev->dev, "%s -> %d\n", __func__, new_state);
-
-// 	mutex_lock(&mdev_state->state_mutex);
-// 	while (mdev_state->state != new_state) {
-// 		enum vfio_device_mig_state next_state;
-// 		int rc = vfio_mig_get_next_state(vdev, mdev_state->state,
-// 						 new_state, &next_state);
-// 		if (rc) {
-// 			ret = ERR_PTR(rc);
-// 			break;
-// 		}
-
-// 		ret = mtty_step_state(mdev_state, next_state);
-// 		if (IS_ERR(ret))
-// 			break;
-
-// 		mdev_state->state = next_state;
-
-// 		if (WARN_ON(ret && new_state != next_state)) {
-// 			fput(ret);
-// 			ret = ERR_PTR(-EINVAL);
-// 			break;
-// 		}
-// 	}
-// 	mtty_state_mutex_unlock(mdev_state);
-// 	return ret;
-// }
-
-// static int mtty_get_state(struct vfio_device *vdev,
-// 			  enum vfio_device_mig_state *current_state)
-// {
-// 	struct mdev_state *mdev_state =
-// 		container_of(vdev, struct mdev_state, vdev);
-
-// 	mutex_lock(&mdev_state->state_mutex);
-// 	*current_state = mdev_state->state;
-// 	mtty_state_mutex_unlock(mdev_state);
-// 	return 0;
-// }
-
-// static int mtty_get_data_size(struct vfio_device *vdev,
-// 			      unsigned long *stop_copy_length)
-// {
-// 	struct mdev_state *mdev_state =
-// 		container_of(vdev, struct mdev_state, vdev);
-
-// 	*stop_copy_length = mtty_data_size(mdev_state);
-// 	return 0;
-// }
-
-// static const struct vfio_migration_ops mtty_migration_ops = {
-// 	.migration_set_state = mtty_set_state,
-// 	.migration_get_state = mtty_get_state,
-// 	.migration_get_data_size = mtty_get_data_size,
-// };
-
-// static int mtty_log_start(struct vfio_device *vdev,
-// 			  struct rb_root_cached *ranges,
-// 			  u32 nnodes, u64 *page_size)
-// {
-// 	return 0;
-// }
-
-// static int mtty_log_stop(struct vfio_device *vdev)
-// {
-// 	return 0;
-// }
-
-// static int mtty_log_read_and_clear(struct vfio_device *vdev,
-// 				   unsigned long iova, unsigned long length,
-// 				   struct iova_bitmap *dirty)
-// {
-// 	return 0;
-// }
-
-// static const struct vfio_log_ops mtty_log_ops = {
-// 	.log_start = mtty_log_start,
-// 	.log_stop = mtty_log_stop,
-// 	.log_read_and_clear = mtty_log_read_and_clear,
-// };
 
 static int mmdev_init_dev(struct vfio_device *vdev)
 {
@@ -1412,20 +985,9 @@ static int mmdev_init_dev(struct vfio_device *vdev)
 	mdev_state->mdev = mdev;
 	mmdev_create_config_space(mdev_state);
 
-	mutex_init(&mdev_state->state_mutex);
-	mutex_init(&mdev_state->reset_mutex);
-
 	vdev->migration_flags = 0;
 	vdev->mig_ops = NULL;
 	vdev->log_ops = NULL;
-
-	// vdev->migration_flags = VFIO_MIGRATION_STOP_COPY |
-	// 			VFIO_MIGRATION_P2P |
-	// 			VFIO_MIGRATION_PRE_COPY;
-	// vdev->mig_ops = &mtty_migration_ops;
-	// vdev->log_ops = &mtty_log_ops;
-
-	mdev_state->state = VFIO_DEVICE_STATE_RUNNING;
 
 	/* allocate backing memory for BAR2 (mappable) */
 	mdev_state->memsize = MMDEV_MMIO_BAR_SIZE;
@@ -1435,6 +997,23 @@ static int mmdev_init_dev(struct vfio_device *vdev)
 		goto err_nr_ports;
 	}
 
+    if (kfifo_alloc(&mdev_state->queue, QUEUE_SIZE, GFP_KERNEL)) {
+        return -ENOMEM;
+    }
+    mdev_state->priority = 1;
+    mdev_state->timeslice_ms = 100;
+    mutex_init(&mdev_state->write_lock);
+    INIT_LIST_HEAD(&mdev_state->list_node);
+
+    strscpy(mdev_state->uuid,
+        dev_name(mdev_dev(mdev)),
+        sizeof(mdev_state->uuid));
+
+	mutex_lock(&mmdev_dev.list_lock);
+	list_add_tail(&mdev_state->list_node, &mmdev_dev.instances);
+	mutex_unlock(&mmdev_dev.list_lock);
+	wake_up_interruptible(&mmdev_dev.wake_sched);
+
 	return 0;
 
 err_nr_ports:
@@ -1442,8 +1021,13 @@ err_nr_ports:
 	return ret;
 }
 
+static DEVICE_ATTR(in, 0220, NULL, mdev_in_store);
+static DEVICE_ATTR(priority, 0220, NULL, mdev_modify_priority_store);
+
 static int mmdev_probe(struct mdev_device *mdev)
 {
+	pr_info("%s: probe mdev=%p dev=%p\n", MMDEV_NAME,
+        mdev, mdev_dev(mdev));
 	struct mdev_state *mdev_state;
 	int ret;
 
@@ -1456,6 +1040,18 @@ static int mmdev_probe(struct mdev_device *mdev)
 	if (ret)
 		goto err_put_vdev;
 	dev_set_drvdata(&mdev->dev, mdev_state);
+
+    ret = device_create_file(mdev_dev(mdev), &dev_attr_in);
+    if (ret) {
+        pr_err("%s: failed to create /sys/.../in (%d)\n", MMDEV_NAME, ret);
+        return ret;
+    }
+    ret = device_create_file(mdev_dev(mdev), &dev_attr_priority);
+    if (ret) {
+        pr_err("%s: failed to create /sys/.../priority (%d)\n", MMDEV_NAME, ret);
+        return ret;
+    }
+
 	return 0;
 
 err_put_vdev:
@@ -1468,11 +1064,16 @@ static void mmdev_release_dev(struct vfio_device *vdev)
 	struct mdev_state *mdev_state =
 		container_of(vdev, struct mdev_state, vdev);
 
-	mutex_destroy(&mdev_state->reset_mutex);
-	mutex_destroy(&mdev_state->state_mutex);
 	atomic_add(mdev_state->nr_ports, &mdev_avail_ports);
 	if (mdev_state->memblk)
 		vfree(mdev_state->memblk);
+
+	mdev_state->running = false;
+	mutex_lock(&mmdev_dev.list_lock);
+	list_del_init(&mdev_state->list_node);
+	mutex_unlock(&mmdev_dev.list_lock);
+    kfifo_free(&mdev_state->queue);
+
 	kfree(mdev_state->vconfig);
 }
 
@@ -1516,26 +1117,19 @@ static int mmdev_mmap(struct vfio_device *vdev, struct vm_area_struct *vma)
 
 static void mmdev_remove(struct mdev_device *mdev)
 {
+	pr_info("%s: remove mdev=%p dev=%p\n", MMDEV_NAME,
+        mdev, mdev_dev(mdev));
+
+    /* remove attribute and instance */
+    device_remove_file(mdev_dev(mdev), &dev_attr_in);
+    device_remove_file(mdev_dev(mdev), &dev_attr_priority);
+
 	struct mdev_state *mdev_state = dev_get_drvdata(&mdev->dev);
 
 	vfio_unregister_group_dev(&mdev_state->vdev);
 	vfio_put_device(&mdev_state->vdev);
-}
 
-static int mmdev_reset(struct mdev_state *mdev_state)
-{
-	pr_info("%s: called\n", __func__);
-
-	mutex_lock(&mdev_state->reset_mutex);
-	mdev_state->deferred_reset = true;
-	if (!mutex_trylock(&mdev_state->state_mutex)) {
-		mutex_unlock(&mdev_state->reset_mutex);
-		return 0;
-	}
-	mutex_unlock(&mdev_state->reset_mutex);
-	mtty_state_mutex_unlock(mdev_state);
-
-	return 0;
+	pr_info("%s: removed mdev instance\n", MMDEV_NAME);
 }
 
 static ssize_t mmdev_read(struct vfio_device *vdev, char __user *buf,
@@ -1871,8 +1465,6 @@ static int mmdev_get_region_info(struct mdev_state *mdev_state,
 		break;
 	case VFIO_PCI_BAR2_REGION_INDEX:
 			 size = MMDEV_MMIO_BAR_SIZE;
-			 region_info->flags = VFIO_REGION_INFO_FLAG_READ |
-					VFIO_REGION_INFO_FLAG_WRITE | VFIO_REGION_INFO_FLAG_MMAP;
 		break;
 	default:
 		size = 0;
@@ -2035,7 +1627,10 @@ static long mmdev_ioctl(struct vfio_device *vdev, unsigned int cmd,
 		return ret;
 	}
 	case VFIO_DEVICE_RESET:
-		return mmdev_reset(mdev_state);
+	{
+		pr_err("%s: VFIO_DEVICE_RESET not supported\n", MMDEV_NAME);
+		return -ENOTTY;
+	}
 	}
 	return -ENOTTY;
 }
@@ -2076,13 +1671,12 @@ static void mmdev_close(struct vfio_device *vdev)
 	struct mdev_state *mdev_state =
 				container_of(vdev, struct mdev_state, vdev);
 
-	// mtty_disable_files(mdev_state);
 	mmdev_disable_intx(mdev_state);
 	mmdev_disable_msi(mdev_state);
 }
 
 static const struct vfio_device_ops mmdev_dev_ops = {
-	.name = "vfio-mtty",
+	.name = "vfio-mmdev",
 	.init = mmdev_init_dev,
 	.release = mmdev_release_dev,
 	.read = mmdev_read,
@@ -2109,9 +1703,60 @@ static struct mdev_driver mmdev_driver = {
 	.get_available = mmdev_get_available,
 };
 
+
+static int mdev_dsched_pdrv_probe(void)
+{
+    int ret;
+
+    INIT_LIST_HEAD(&mmdev_dev.instances);
+    mutex_init(&mmdev_dev.list_lock);
+    init_waitqueue_head(&mmdev_dev.wake_sched);
+    mmdev_dev.stop = false;
+
+    {
+        struct timespec64 ts;
+        struct tm tm;
+
+        ktime_get_real_ts64(&ts);
+        time64_to_tm(ts.tv_sec, 0, &tm);
+
+        snprintf(mmdev_dev.log_path, sizeof(mmdev_dev.log_path),
+                LOG_DIR "/%s_%04ld%02d%02d_%02d%02d%02d.txt",
+                LOG_PREFIX,
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec);
+
+        dev_info(&mmdev_dev.dev, "log file: %s\n", mmdev_dev.log_path);
+    }
+
+
+    mmdev_dev.sched_thread = kthread_run(sched_thread_fn, &mmdev_dev, "mdev_sched");
+    if (IS_ERR(mmdev_dev.sched_thread)) {
+        ret = PTR_ERR(mmdev_dev.sched_thread);
+        return ret;
+    }
+
+    dev_info(&mmdev_dev.dev, "parent registered and scheduler thread started\n");
+    return 0;
+}
+
+static int mdev_dsched_pdrv_remove(void)
+{
+    mmdev_dev.stop = true;
+    if (mmdev_dev.sched_thread)
+        kthread_stop(mmdev_dev.sched_thread);
+    return 0;
+}
+
+
 static void mmdev_device_release(struct device *dev)
 {
 	dev_dbg(dev, "mtty: released\n");
+	mdev_dsched_pdrv_remove();
 }
 
 static int __init mmdev_dev_init(void)
@@ -2156,6 +1801,9 @@ static int __init mmdev_dev_init(void)
 	ret = device_register(&mmdev_dev.dev);
 	if (ret)
 		goto err_put;
+	ret = mdev_dsched_pdrv_probe();
+	if (ret)
+		goto err_device;
 
 	ret = mdev_register_parent(&mmdev_dev.parent, &mmdev_dev.dev,
 				   &mmdev_driver, mmdev_mdev_types,
